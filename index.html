@@ -2,157 +2,75 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Download Pop!_OS 24.04 NVIDIA ISO</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 3rem auto; line-height: 1.5; }
-    button { padding: 0.75rem 1.25rem; font-size: 1rem; cursor: pointer; }
-    progress { width: 100%; height: 1.25rem; margin-top: 1rem; display: none; }
-    #status { margin-top: 0.75rem; font-family: monospace; }
-  </style>
+  <title>Sequential ISO Streamer</title>
 </head>
 <body>
-  <h2>Pop!_OS 24.04 AMD64 NVIDIA ISO</h2>
-  <button id="downloadBtn">Download & Merge ISO (8 Parts)</button>
-  <progress id="progressBar" value="0" max="100"></progress>
-  <div id="status">Initializing...</div>
+  <button id="btn">Download Pop!_OS ISO (8 Parts)</button>
+  <pre id="log">Ready.</pre>
 
   <script>
-    const WORKER_BASE = 'https://gh.nexa.workers.dev';
-    const RELEASE_PATH = '/xecured/files/releases/download/arch-iso-512';
-    const BASE_FILENAME = 'pop-os_24.04_amd64_nvidia_25.iso';
-    const TOTAL_PARTS = 8;
-
-    const btn = document.getElementById('downloadBtn');
-    const progressBar = document.getElementById('progressBar');
-    const statusEl = document.getElementById('status');
-
-    // Build the 8 slice URLs directly through your Cloudflare Worker
-    const SLICE_URLS = Array.from({ length: TOTAL_PARTS }, (_, i) =>
-      `${WORKER_BASE}${RELEASE_PATH}/${BASE_FILENAME}.part${i + 1}`
+    const PARTS = Array.from({ length: 8 }, (_, i) =>
+      `https://gh.nexa.workers.dev/xecured/files/releases/download/arch-iso-512/pop-os_24.04_amd64_nvidia_25.iso.part${i + 1}`
     );
+    const FILENAME = 'pop-os_24.04_amd64_nvidia_25.iso';
+    const log = (msg) => (document.getElementById('log').textContent = msg);
 
-    async function ensureServiceWorker() {
-      if (!('serviceWorker' in navigator)) {
-        throw new Error('Service Workers are not supported in this browser.');
-      }
-      const reg = await navigator.serviceWorker.register('./sw.js');
-      await navigator.serviceWorker.ready;
-
-      if (!navigator.serviceWorker.controller) {
-        await new Promise((resolve) => {
-          navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
-        });
-      }
-      return reg;
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js');
     }
 
-    ensureServiceWorker()
-      .then(() => { statusEl.textContent = 'Ready.'; })
-      .catch((err) => { statusEl.textContent = `Warning: ${err.message}`; });
+    async function streamSequentially(writer) {
+      let totalDownloaded = 0;
 
-    // Query exact byte sizes via parallel HEAD requests (no GitHub API rate limits)
-    async function getSliceSizes() {
-      statusEl.textContent = 'Checking file sizes...';
-      const sizes = await Promise.all(
-        SLICE_URLS.map(async (url, idx) => {
-          const res = await fetch(url, { method: 'HEAD' });
-          if (!res.ok) throw new Error(`Failed checking part ${idx + 1} (${res.status})`);
-          return Number(res.headers.get('Content-Length') || 0);
-        })
-      );
-      return sizes;
-    }
+      for (let i = 0; i < PARTS.length; i++) {
+        const res = await fetch(PARTS[i]);
+        if (!res.ok) throw new Error(`Part ${i + 1} failed: HTTP ${res.status}`);
 
-    async function pipeSlicesToWriter(writer, totalBytes) {
-      let downloadedBytes = 0;
+        const reader = res.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-      progressBar.style.display = 'block';
-      progressBar.value = 0;
-
-      try {
-        for (let i = 0; i < SLICE_URLS.length; i++) {
-          const chunkRes = await fetch(SLICE_URLS[i]);
-          if (!chunkRes.ok) throw new Error(`Failed on part ${i + 1} (${chunkRes.status})`);
-
-          const reader = chunkRes.body.getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            await writer.write(value);
-            downloadedBytes += value.byteLength;
-
-            if (totalBytes > 0) {
-              const pct = ((downloadedBytes / totalBytes) * 100).toFixed(1);
-              progressBar.value = pct;
-              statusEl.textContent = `Part ${i + 1}/${SLICE_URLS.length} — ${pct}% (${(downloadedBytes / 1e9).toFixed(2)} / ${(totalBytes / 1e9).toFixed(2)} GB)`;
-            } else {
-              statusEl.textContent = `Part ${i + 1}/${SLICE_URLS.length} — ${(downloadedBytes / 1e9).toFixed(2)} GB downloaded`;
-            }
-          }
+          await writer.write(value);
+          totalDownloaded += value.byteLength;
+          log(`Streaming Part ${i + 1}/${PARTS.length} — ${(totalDownloaded / 1e9).toFixed(2)} GB written`);
         }
-        await writer.close();
-        statusEl.textContent = `Complete! Saved ${BASE_FILENAME} (${(downloadedBytes / 1e9).toFixed(2)} GB).`;
-      } catch (err) {
-        await writer.abort(err);
-        throw err;
       }
+
+      await writer.close();
+      log(`Done! ${(totalDownloaded / 1e9).toFixed(2)} GB saved as ${FILENAME}`);
     }
 
-    btn.addEventListener('click', async () => {
-      btn.disabled = true;
-
+    document.getElementById('btn').onclick = async () => {
       try {
-        // PATH A: Chromium (Direct Disk Stream via File System Access API)
+        // Chromium: Direct disk stream
         if ('showSaveFilePicker' in window) {
-          const fileHandle = await window.showSaveFilePicker({
-            suggestedName: BASE_FILENAME,
-          });
-          const sizes = await getSliceSizes();
-          const totalBytes = sizes.reduce((a, b) => a + b, 0);
-          const writable = await fileHandle.createWritable();
-          await pipeSlicesToWriter(writable.getWriter(), totalBytes);
+          const handle = await window.showSaveFilePicker({ suggestedName: FILENAME });
+          const writable = await handle.createWritable();
+          await streamSequentially(writable.getWriter());
           return;
         }
 
-        // PATH B: Firefox & Safari (Transferable TransformStream -> Service Worker)
-        await ensureServiceWorker();
-        const sizes = await getSliceSizes();
-        const totalBytes = sizes.reduce((a, b) => a + b, 0);
-
+        // Firefox / Safari: Stream through Service Worker into native Download Manager
+        await navigator.serviceWorker.ready;
         const { readable, writable } = new TransformStream();
-        const streamId = crypto.randomUUID();
+        const id = crypto.randomUUID();
 
         navigator.serviceWorker.controller.postMessage(
-          {
-            type: 'REGISTER_STREAM',
-            id: streamId,
-            readable,
-            filename: BASE_FILENAME,
-            totalBytes,
-          },
+          { type: 'STREAM', id, readable, filename: FILENAME },
           [readable]
         );
 
         const a = document.createElement('a');
-        a.href = `./virtual-download/${encodeURIComponent(BASE_FILENAME)}?id=${streamId}`;
-        a.download = BASE_FILENAME;
-        document.body.appendChild(a);
+        a.href = `./virtual-download/${FILENAME}?id=${id}`;
+        a.download = FILENAME;
         a.click();
-        a.remove();
 
-        await pipeSlicesToWriter(writable.getWriter(), totalBytes);
+        await streamSequentially(writable.getWriter());
       } catch (err) {
-        if (err.name !== 'AbortError') {
-          statusEl.textContent = `Error: ${err.message}`;
-          console.error(err);
-        } else {
-          statusEl.textContent = 'Save cancelled.';
-        }
-      } finally {
-        btn.disabled = false;
+        if (err.name !== 'AbortError') log(`Error: ${err.message}`);
       }
-    });
+    };
   </script>
 </body>
 </html>
