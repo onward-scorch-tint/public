@@ -2,74 +2,31 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Sequential ISO Streamer</title>
+  <title>Download Pop!_OS ISO</title>
 </head>
 <body>
   <button id="btn">Download Pop!_OS ISO (8 Parts)</button>
-  <pre id="log">Ready.</pre>
+  <pre id="log">Initializing...</pre>
 
   <script>
-    const PARTS = Array.from({ length: 8 }, (_, i) =>
-      `https://gh.nexa.workers.dev/xecured/files/releases/download/arch-iso-512/pop-os_24.04_amd64_nvidia_25.iso.part${i + 1}`
-    );
-    const FILENAME = 'pop-os_24.04_amd64_nvidia_25.iso';
     const log = (msg) => (document.getElementById('log').textContent = msg);
 
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('./sw.js');
-    }
-
-    async function streamSequentially(writer) {
-      let totalDownloaded = 0;
-
-      for (let i = 0; i < PARTS.length; i++) {
-        const res = await fetch(PARTS[i]);
-        if (!res.ok) throw new Error(`Part ${i + 1} failed: HTTP ${res.status}`);
-
-        const reader = res.body.getReader();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          await writer.write(value);
-          totalDownloaded += value.byteLength;
-          log(`Streaming Part ${i + 1}/${PARTS.length} — ${(totalDownloaded / 1e9).toFixed(2)} GB written`);
-        }
-      }
-
-      await writer.close();
-      log(`Done! ${(totalDownloaded / 1e9).toFixed(2)} GB saved as ${FILENAME}`);
-    }
-
-    document.getElementById('btn').onclick = async () => {
-      try {
-        // Chromium: Direct disk stream
-        if ('showSaveFilePicker' in window) {
-          const handle = await window.showSaveFilePicker({ suggestedName: FILENAME });
-          const writable = await handle.createWritable();
-          await streamSequentially(writable.getWriter());
-          return;
-        }
-
-        // Firefox / Safari: Stream through Service Worker into native Download Manager
-        await navigator.serviceWorker.ready;
-        const { readable, writable } = new TransformStream();
-        const id = crypto.randomUUID();
-
-        navigator.serviceWorker.controller.postMessage(
-          { type: 'STREAM', id, readable, filename: FILENAME },
-          [readable]
+    async function init() {
+      const reg = await navigator.serviceWorker.register('./sw.js');
+      await navigator.serviceWorker.ready;
+      if (!navigator.serviceWorker.controller) {
+        await new Promise((r) =>
+          navigator.serviceWorker.addEventListener('controllerchange', r, { once: true })
         );
-
-        const a = document.createElement('a');
-        a.href = `./virtual-download/${FILENAME}?id=${id}`;
-        a.download = FILENAME;
-        a.click();
-
-        await streamSequentially(writable.getWriter());
-      } catch (err) {
-        if (err.name !== 'AbortError') log(`Error: ${err.message}`);
       }
+      log('Ready. Click to start download in Firefox Download Manager.');
+    }
+
+    init().catch((e) => log(`SW Error: ${e.message}`));
+
+    document.getElementById('btn').onclick = () => {
+      log('Download started — check Firefox Downloads (Ctrl+J) for progress.');
+      window.location.href = './download-merged-iso';
     };
   </script>
 </body>
