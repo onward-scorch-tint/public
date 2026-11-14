@@ -1,32 +1,28 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <title>Download Pop!_OS ISO</title>
-</head>
+<html>
 <body>
-  <button id="btn">Download Pop!_OS ISO (8 Parts)</button>
+  <button id="btn">Download ISO</button>
   <pre id="log">Initializing...</pre>
 
   <script>
-    const log = (msg) => (document.getElementById('log').textContent = msg);
+    const log = (t) => (document.getElementById('log').textContent = t);
 
-    async function init() {
-      const reg = await navigator.serviceWorker.register('./sw.js');
+    (async () => {
+      await navigator.serviceWorker.register('./sw.js');
       await navigator.serviceWorker.ready;
       if (!navigator.serviceWorker.controller) {
-        await new Promise((r) =>
-          navigator.serviceWorker.addEventListener('controllerchange', r, { once: true })
-        );
+        await new Promise((r) => navigator.serviceWorker.addEventListener('controllerchange', r, { once: true }));
       }
-      log('Ready. Click to start download in Firefox Download Manager.');
-    }
-
-    init().catch((e) => log(`SW Error: ${e.message}`));
+      setInterval(() => navigator.serviceWorker.controller?.postMessage('ping'), 5000);
+      log('Ready.');
+    })();
 
     document.getElementById('btn').onclick = () => {
-      log('Download started — check Firefox Downloads (Ctrl+J) for progress.');
-      window.location.href = './download-merged-iso';
+      log('Downloading — check Ctrl+J. Keep this tab open.');
+      const a = document.createElement('a');
+      a.href = './download-iso';
+      a.download = 'pop-os_24.04_amd64_nvidia_25.iso';
+      a.click();
     };
   </script>
 </body>
