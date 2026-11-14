@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Download Pop!_OS 24.04 NVIDIA ISO</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 3rem auto; line-height: 1.5; }
+    button { padding: 0.75rem 1.25rem; font-size: 1rem; cursor: pointer; }
+    progress { width: 100%; height: 1.25rem; margin-top: 1rem; display: none; }
+    #status { margin-top: 0.75rem; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <h2>Pop!_OS 24.04 AMD64 NVIDIA ISO</h2>
+  <button id="downloadBtn">Download & Merge ISO (8 Parts)</button>
+  <progress id="progressBar" value="0" max="100"></progress>
+  <div id="status">Initializing...</div>
+
+  <script>
+    const OWNER = 'xecured';
+    const REPO = 'files';
+    const TAG = 'arch-iso-512';
+    const BASE_FILENAME = 'pop-os_24.04_amd64_nvidia_25.iso';
+
+    const btn = document.getElementById('downloadBtn');
+    const progressBar = document.getElementById('progressBar');
+    const statusEl = document.getElementById('status');
+
+    // Register Service Worker for Firefox / Safari support
+    async function ensureServiceWorker() {
+      if (!('serviceWorker' in navigator)) {
+        throw new Error('Service Workers are not supported in this browser.');
+      }
+      await navigator.serviceWorker.register('./sw.js');
+      await navigator.serviceWorker.ready;
+    }
+
+    ensureServiceWorker()
+      .then(() => { statusEl.textContent = 'Ready.'; })
+      .catch((err) => { statusEl.textContent = `Warning: ${err.message}`; });
+
+    btn.addEventListener('click', async () => {
+      // PATH A: Chromium (Direct Disk Stream via File System Access API)
+      if ('showSaveFilePicker' in window) {
+        try {
+          btn.disabled = true;
+          progressBar.style.display = 'block';
+
+          const fileHandle = await window.showSaveFilePicker({
+            suggestedName: BASE_FILENAME,
+          });
+
+          statusEl.textContent = 'Fetching release metadata...';
+          const releaseRes = await fetch(
+            `https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/${TAG}`
+          );
+          if (!releaseRes.ok) throw new Error(`GitHub API error: ${releaseRes.status}`);
+          const releaseData = await releaseRes.json();
+
+          const slices = releaseData.assets
+            .filter((asset) => asset.name.startsWith(`${BASE_FILENAME}.part`))
+            .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+          const totalBytes = slices.reduce((sum, s) => sum + s.size, 0);
+          let downloadedBytes = 0;
+
+          const writableStream = await fileHandle.createWritable();
+          const writer = writableStream.getWriter();
+
+          try {
+            for (let i = 0; i < slices.length; i++) {
+              const slice = slices[i];
+              const chunkRes = await fetch(slice.url, {
+                headers: { Accept: 'application/octet-stream' },
+              });
+              if (!chunkRes.ok) throw new Error(`Failed on ${slice.name}`);
+
+              const reader = chunkRes.body.getReader();
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                await writer.write(value);
+                downloadedBytes += value.byteLength;
+
+                const pct = ((downloadedBytes / totalBytes) * 100).toFixed(1);
+                progressBar.value = pct;
+                statusEl.textContent = `Part ${i + 1}/${slices.length} — ${pct}% (${(downloadedBytes / 1e9).toFixed(2)} / ${(totalBytes / 1e9).toFixed(2)} GB)`;
+              }
+            }
+          } finally {
+            await writer.close();
+          }
+
+          statusEl.textContent = `Complete! Saved ${BASE_FILENAME}.`;
+        } catch (err) {
+          if (err.name !== 'AbortError') statusEl.textContent = `Error: ${err.message}`;
+        } finally {
+          btn.disabled = false;
+        }
+        return;
+      }
+
+      // PATH B: Firefox & Safari (Service Worker Stream to Native Download Manager)
+      try {
+        await ensureServiceWorker();
+        const params = new URLSearchParams({ owner: OWNER, repo: REPO, tag: TAG });
+        const virtualUrl = `./virtual-download/${encodeURIComponent(BASE_FILENAME)}?${params}`;
+
+        statusEl.textContent = 'Download started! Check your browser’s Downloads bar for progress.';
+        
+        // Trigger native download without leaving the current page
+        const a = document.createElement('a');
+        a.href = virtualUrl;
+        a.download = BASE_FILENAME;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      } catch (err) {
+        statusEl.textContent = `Error: ${err.message}`;
+      }
+    });
+  </script>
+</body>
+</html>
