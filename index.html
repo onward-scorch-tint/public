@@ -17,14 +17,19 @@
   <div id="status">Initializing...</div>
 
   <script>
-    const OWNER = 'xecured';
-    const REPO = 'files';
-    const TAG = 'arch-iso-512';
+    const WORKER_BASE = 'https://gh.nexa.workers.dev';
+    const RELEASE_PATH = '/xecured/files/releases/download/arch-iso-512';
     const BASE_FILENAME = 'pop-os_24.04_amd64_nvidia_25.iso';
+    const TOTAL_PARTS = 8;
 
     const btn = document.getElementById('downloadBtn');
     const progressBar = document.getElementById('progressBar');
     const statusEl = document.getElementById('status');
+
+    // Build the 8 slice URLs directly through your Cloudflare Worker
+    const SLICE_URLS = Array.from({ length: TOTAL_PARTS }, (_, i) =>
+      `${WORKER_BASE}${RELEASE_PATH}/${BASE_FILENAME}.part${i + 1}`
+    );
 
     async function ensureServiceWorker() {
       if (!('serviceWorker' in navigator)) {
@@ -33,7 +38,6 @@
       const reg = await navigator.serviceWorker.register('./sw.js');
       await navigator.serviceWorker.ready;
 
-      // Ensure the page is actively controlled by the Service Worker on first load
       if (!navigator.serviceWorker.controller) {
         await new Promise((resolve) => {
           navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
@@ -46,36 +50,29 @@
       .then(() => { statusEl.textContent = 'Ready.'; })
       .catch((err) => { statusEl.textContent = `Warning: ${err.message}`; });
 
-    async function getSlices() {
-      statusEl.textContent = 'Fetching release metadata...';
-      const releaseRes = await fetch(
-        `https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/${TAG}`
+    // Query exact byte sizes via parallel HEAD requests (no GitHub API rate limits)
+    async function getSliceSizes() {
+      statusEl.textContent = 'Checking file sizes...';
+      const sizes = await Promise.all(
+        SLICE_URLS.map(async (url, idx) => {
+          const res = await fetch(url, { method: 'HEAD' });
+          if (!res.ok) throw new Error(`Failed checking part ${idx + 1} (${res.status})`);
+          return Number(res.headers.get('Content-Length') || 0);
+        })
       );
-      if (!releaseRes.ok) throw new Error(`GitHub API error: ${releaseRes.status}`);
-      const releaseData = await releaseRes.json();
-
-      const slices = releaseData.assets
-        .filter((asset) => asset.name.startsWith(`${BASE_FILENAME}.part`))
-        .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-
-      if (slices.length === 0) throw new Error('No matching ISO slices found.');
-      return slices;
+      return sizes;
     }
 
-    async function pipeSlicesToWriter(slices, writer) {
-      const totalBytes = slices.reduce((sum, s) => sum + s.size, 0);
+    async function pipeSlicesToWriter(writer, totalBytes) {
       let downloadedBytes = 0;
 
       progressBar.style.display = 'block';
       progressBar.value = 0;
 
       try {
-        for (let i = 0; i < slices.length; i++) {
-          const slice = slices[i];
-          const chunkRes = await fetch(slice.url, {
-            headers: { Accept: 'application/octet-stream' },
-          });
-          if (!chunkRes.ok) throw new Error(`Failed on ${slice.name} (${chunkRes.status})`);
+        for (let i = 0; i < SLICE_URLS.length; i++) {
+          const chunkRes = await fetch(SLICE_URLS[i]);
+          if (!chunkRes.ok) throw new Error(`Failed on part ${i + 1} (${chunkRes.status})`);
 
           const reader = chunkRes.body.getReader();
           while (true) {
@@ -85,13 +82,17 @@
             await writer.write(value);
             downloadedBytes += value.byteLength;
 
-            const pct = ((downloadedBytes / totalBytes) * 100).toFixed(1);
-            progressBar.value = pct;
-            statusEl.textContent = `Part ${i + 1}/${slices.length} — ${pct}% (${(downloadedBytes / 1e9).toFixed(2)} / ${(totalBytes / 1e9).toFixed(2)} GB)`;
+            if (totalBytes > 0) {
+              const pct = ((downloadedBytes / totalBytes) * 100).toFixed(1);
+              progressBar.value = pct;
+              statusEl.textContent = `Part ${i + 1}/${SLICE_URLS.length} — ${pct}% (${(downloadedBytes / 1e9).toFixed(2)} / ${(totalBytes / 1e9).toFixed(2)} GB)`;
+            } else {
+              statusEl.textContent = `Part ${i + 1}/${SLICE_URLS.length} — ${(downloadedBytes / 1e9).toFixed(2)} GB downloaded`;
+            }
           }
         }
         await writer.close();
-        statusEl.textContent = `Complete! Saved ${BASE_FILENAME} (${(totalBytes / 1e9).toFixed(2)} GB).`;
+        statusEl.textContent = `Complete! Saved ${BASE_FILENAME} (${(downloadedBytes / 1e9).toFixed(2)} GB).`;
       } catch (err) {
         await writer.abort(err);
         throw err;
@@ -107,21 +108,21 @@
           const fileHandle = await window.showSaveFilePicker({
             suggestedName: BASE_FILENAME,
           });
-          const slices = await getSlices();
+          const sizes = await getSliceSizes();
+          const totalBytes = sizes.reduce((a, b) => a + b, 0);
           const writable = await fileHandle.createWritable();
-          await pipeSlicesToWriter(slices, writable.getWriter());
+          await pipeSlicesToWriter(writable.getWriter(), totalBytes);
           return;
         }
 
         // PATH B: Firefox & Safari (Transferable TransformStream -> Service Worker)
         await ensureServiceWorker();
-        const slices = await getSlices();
-        const totalBytes = slices.reduce((sum, s) => sum + s.size, 0);
+        const sizes = await getSliceSizes();
+        const totalBytes = sizes.reduce((a, b) => a + b, 0);
 
         const { readable, writable } = new TransformStream();
         const streamId = crypto.randomUUID();
 
-        // Transfer the readable half of the stream to the Service Worker
         navigator.serviceWorker.controller.postMessage(
           {
             type: 'REGISTER_STREAM',
@@ -133,7 +134,6 @@
           [readable]
         );
 
-        // Trigger the download in Firefox's download manager
         const a = document.createElement('a');
         a.href = `./virtual-download/${encodeURIComponent(BASE_FILENAME)}?id=${streamId}`;
         a.download = BASE_FILENAME;
@@ -141,8 +141,7 @@
         a.click();
         a.remove();
 
-        // Stream all 8 parts from page context directly into Firefox's download pipe
-        await pipeSlicesToWriter(slices, writable.getWriter());
+        await pipeSlicesToWriter(writable.getWriter(), totalBytes);
       } catch (err) {
         if (err.name !== 'AbortError') {
           statusEl.textContent = `Error: ${err.message}`;
