@@ -1,41 +1,31 @@
 self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
 
-const pendingStreams = new Map();
+const streams = new Map();
 
-// Receive the ReadableStream from index.html
-self.addEventListener('message', (event) => {
-  if (event.data && event.data.type === 'REGISTER_STREAM') {
-    const { id, readable, filename, totalBytes } = event.data;
-    pendingStreams.set(id, { readable, filename, totalBytes });
+self.addEventListener('message', (e) => {
+  if (e.data?.type === 'STREAM') {
+    streams.set(e.data.id, e.data);
   }
 });
 
-// Hand that ReadableStream directly to Firefox's native Download Manager
-self.addEventListener('fetch', (event) => {
-  const url = new URL(event.request.url);
+self.addEventListener('fetch', (e) => {
+  const url = new URL(e.request.url);
+  if (!url.pathname.includes('/virtual-download/')) return;
 
-  if (url.pathname.includes('/virtual-download/')) {
-    const id = url.searchParams.get('id');
-    const entry = pendingStreams.get(id);
-
-    if (!entry) {
-      event.respondWith(new Response('Stream expired or not found.', { status: 404 }));
-      return;
-    }
-
-    pendingStreams.delete(id);
-
-    event.respondWith(
-      new Response(entry.readable, {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'Content-Disposition': `attachment; filename="${entry.filename}"`,
-          'Content-Length': String(entry.totalBytes),
-          'Cache-Control': 'no-store',
-        },
-      })
-    );
+  const entry = streams.get(url.searchParams.get('id'));
+  if (!entry) {
+    e.respondWith(new Response('Not found', { status: 404 }));
+    return;
   }
+  streams.delete(url.searchParams.get('id'));
+
+  e.respondWith(
+    new Response(entry.readable, {
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${entry.filename}"`,
+      },
+    })
+  );
 });
