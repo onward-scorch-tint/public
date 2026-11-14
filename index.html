@@ -26,97 +26,132 @@
     const progressBar = document.getElementById('progressBar');
     const statusEl = document.getElementById('status');
 
-    // Register Service Worker for Firefox / Safari support
     async function ensureServiceWorker() {
       if (!('serviceWorker' in navigator)) {
         throw new Error('Service Workers are not supported in this browser.');
       }
-      await navigator.serviceWorker.register('./sw.js');
+      const reg = await navigator.serviceWorker.register('./sw.js');
       await navigator.serviceWorker.ready;
+
+      // Ensure the page is actively controlled by the Service Worker on first load
+      if (!navigator.serviceWorker.controller) {
+        await new Promise((resolve) => {
+          navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
+        });
+      }
+      return reg;
     }
 
     ensureServiceWorker()
       .then(() => { statusEl.textContent = 'Ready.'; })
       .catch((err) => { statusEl.textContent = `Warning: ${err.message}`; });
 
-    btn.addEventListener('click', async () => {
-      // PATH A: Chromium (Direct Disk Stream via File System Access API)
-      if ('showSaveFilePicker' in window) {
-        try {
-          btn.disabled = true;
-          progressBar.style.display = 'block';
+    async function getSlices() {
+      statusEl.textContent = 'Fetching release metadata...';
+      const releaseRes = await fetch(
+        `https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/${TAG}`
+      );
+      if (!releaseRes.ok) throw new Error(`GitHub API error: ${releaseRes.status}`);
+      const releaseData = await releaseRes.json();
 
+      const slices = releaseData.assets
+        .filter((asset) => asset.name.startsWith(`${BASE_FILENAME}.part`))
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+      if (slices.length === 0) throw new Error('No matching ISO slices found.');
+      return slices;
+    }
+
+    async function pipeSlicesToWriter(slices, writer) {
+      const totalBytes = slices.reduce((sum, s) => sum + s.size, 0);
+      let downloadedBytes = 0;
+
+      progressBar.style.display = 'block';
+      progressBar.value = 0;
+
+      try {
+        for (let i = 0; i < slices.length; i++) {
+          const slice = slices[i];
+          const chunkRes = await fetch(slice.url, {
+            headers: { Accept: 'application/octet-stream' },
+          });
+          if (!chunkRes.ok) throw new Error(`Failed on ${slice.name} (${chunkRes.status})`);
+
+          const reader = chunkRes.body.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            await writer.write(value);
+            downloadedBytes += value.byteLength;
+
+            const pct = ((downloadedBytes / totalBytes) * 100).toFixed(1);
+            progressBar.value = pct;
+            statusEl.textContent = `Part ${i + 1}/${slices.length} — ${pct}% (${(downloadedBytes / 1e9).toFixed(2)} / ${(totalBytes / 1e9).toFixed(2)} GB)`;
+          }
+        }
+        await writer.close();
+        statusEl.textContent = `Complete! Saved ${BASE_FILENAME} (${(totalBytes / 1e9).toFixed(2)} GB).`;
+      } catch (err) {
+        await writer.abort(err);
+        throw err;
+      }
+    }
+
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+
+      try {
+        // PATH A: Chromium (Direct Disk Stream via File System Access API)
+        if ('showSaveFilePicker' in window) {
           const fileHandle = await window.showSaveFilePicker({
             suggestedName: BASE_FILENAME,
           });
-
-          statusEl.textContent = 'Fetching release metadata...';
-          const releaseRes = await fetch(
-            `https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/${TAG}`
-          );
-          if (!releaseRes.ok) throw new Error(`GitHub API error: ${releaseRes.status}`);
-          const releaseData = await releaseRes.json();
-
-          const slices = releaseData.assets
-            .filter((asset) => asset.name.startsWith(`${BASE_FILENAME}.part`))
-            .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-
-          const totalBytes = slices.reduce((sum, s) => sum + s.size, 0);
-          let downloadedBytes = 0;
-
-          const writableStream = await fileHandle.createWritable();
-          const writer = writableStream.getWriter();
-
-          try {
-            for (let i = 0; i < slices.length; i++) {
-              const slice = slices[i];
-              const chunkRes = await fetch(slice.url, {
-                headers: { Accept: 'application/octet-stream' },
-              });
-              if (!chunkRes.ok) throw new Error(`Failed on ${slice.name}`);
-
-              const reader = chunkRes.body.getReader();
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                await writer.write(value);
-                downloadedBytes += value.byteLength;
-
-                const pct = ((downloadedBytes / totalBytes) * 100).toFixed(1);
-                progressBar.value = pct;
-                statusEl.textContent = `Part ${i + 1}/${slices.length} — ${pct}% (${(downloadedBytes / 1e9).toFixed(2)} / ${(totalBytes / 1e9).toFixed(2)} GB)`;
-              }
-            }
-          } finally {
-            await writer.close();
-          }
-
-          statusEl.textContent = `Complete! Saved ${BASE_FILENAME}.`;
-        } catch (err) {
-          if (err.name !== 'AbortError') statusEl.textContent = `Error: ${err.message}`;
-        } finally {
-          btn.disabled = false;
+          const slices = await getSlices();
+          const writable = await fileHandle.createWritable();
+          await pipeSlicesToWriter(slices, writable.getWriter());
+          return;
         }
-        return;
-      }
 
-      // PATH B: Firefox & Safari (Service Worker Stream to Native Download Manager)
-      try {
+        // PATH B: Firefox & Safari (Transferable TransformStream -> Service Worker)
         await ensureServiceWorker();
-        const params = new URLSearchParams({ owner: OWNER, repo: REPO, tag: TAG });
-        const virtualUrl = `./virtual-download/${encodeURIComponent(BASE_FILENAME)}?${params}`;
+        const slices = await getSlices();
+        const totalBytes = slices.reduce((sum, s) => sum + s.size, 0);
 
-        statusEl.textContent = 'Download started! Check your browser’s Downloads bar for progress.';
-        
-        // Trigger native download without leaving the current page
+        const { readable, writable } = new TransformStream();
+        const streamId = crypto.randomUUID();
+
+        // Transfer the readable half of the stream to the Service Worker
+        navigator.serviceWorker.controller.postMessage(
+          {
+            type: 'REGISTER_STREAM',
+            id: streamId,
+            readable,
+            filename: BASE_FILENAME,
+            totalBytes,
+          },
+          [readable]
+        );
+
+        // Trigger the download in Firefox's download manager
         const a = document.createElement('a');
-        a.href = virtualUrl;
+        a.href = `./virtual-download/${encodeURIComponent(BASE_FILENAME)}?id=${streamId}`;
         a.download = BASE_FILENAME;
         document.body.appendChild(a);
         a.click();
         a.remove();
+
+        // Stream all 8 parts from page context directly into Firefox's download pipe
+        await pipeSlicesToWriter(slices, writable.getWriter());
       } catch (err) {
-        statusEl.textContent = `Error: ${err.message}`;
+        if (err.name !== 'AbortError') {
+          statusEl.textContent = `Error: ${err.message}`;
+          console.error(err);
+        } else {
+          statusEl.textContent = 'Save cancelled.';
+        }
+      } finally {
+        btn.disabled = false;
       }
     });
   </script>
